@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Memo">
+  <!-- 파비콘·탭 아이콘용 벡터 버전. 홈화면 아이콘(icon-*.png)은 icon-src.png를
+       리사이즈한 래스터라서, 이 파일은 그 그림을 16~32px에서도 또렷하도록 도형으로
+       다시 그린 것이다. 좌표·색은 icon-src.png에서 잰 값:
+         그라디언트  좌상 #7258E5, 우하 #CA5C9F
+         앞 카드     x 22.5~77.3% · y 40~73.9%
+         뒤 카드들   각각 4%p씩 안쪽으로, 위로 7~8%p
+       원본 이미지를 바꾸면 여기 값도 다시 재서 맞출 것. 한쪽만 고치면 탭 아이콘과
+       홈화면 아이콘이 서로 다른 그림이 된다.
+
+       16px에서는 글줄 2개가 사실상 사라지지만 카드 3장이 겹친 실루엣은 남는다.
+       그래서 글줄보다 카드의 단 차이를 우선해서 잡았다. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7258E5"/>
+      <stop offset="1" stop-color="#CA5C9F"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 모서리를 깎고 바깥은 투명으로 둔다. 이 파일은 manifest에서 purpose=any 라
+       플랫폼이 마스킹하지 않고 그린 그대로 쓴다. 각진 사각형이면 안드로이드
+       스플래시(배경 #FDF6E3)에 보라 사각형이 그대로 얹힌다. 반지름 22.37%는
+       icon-512.png 와 같은 값(tools/make-icons.py의 RADIUS). -->
+  <rect width="512" height="512" rx="114.5" fill="url(#bg)"/>
+
+  <!-- 쌓인 노트. 뒤로 갈수록 좁고 투명하다 -->
+  <rect x="154" y="126" width="204" height="120" rx="26" fill="#FFFFFF" opacity="0.34"/>
+  <rect x="133" y="164" width="246" height="140" rx="28" fill="#FFFFFF" opacity="0.58"/>
+  <rect x="115" y="205" width="282" height="174" rx="32" fill="#FDF9F3"/>
+
+  <!-- 앞 카드의 글줄 -->
+  <g stroke="#C2559A" stroke-width="26" stroke-linecap="round">
+    <line x1="157" y1="266" x2="355" y2="266"/>
+    <line x1="157" y1="314" x2="281" y2="314"/>
+  </g>
+</svg>

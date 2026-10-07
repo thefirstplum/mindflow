@@ -1,0 +1,566 @@
+// Google Calendar 연동
+// timeBlock과 별개로 Google Calendar 일정을 가져와 추가/수정/삭제한다.
+//
+// 의존: sync.js의 driveClient (OAuth scope에 drive + calendar 포함).
+//       calendar.js의 _renderWeekGrid, _renderMobileCal에서 호출.
+//
+// 데이터 흐름:
+//   1. fetchGCalEvents(timeMin, timeMax)로 기간 일정 가져옴
+//   2. 로컬 캐시 gcalEvents에 저장 (메모리 + localStorage)
+//   3. 캘린더 모드가 'all'/'google'이면 _renderWeekGrid가 gcalEvents 표시
+//   4. CRUD: createGCalEvent / updateGCalEvent / deleteGCalEvent
+//
+// scope (sync.js):
+//   https://www.googleapis.com/auth/calendar (events + calendar list 읽기/쓰기)
+
+const GCAL_API = 'https://www.googleapis.com/calendar/v3';
+
+// 로드한 캘린더 목록 (설정에서 multi-select)
+let gcalCalendars = load('gcal_calendars', []);  // [{id, summary, primary, backgroundColor, foregroundColor, accessRole}]
+let gcalSelectedIds = load('gcal_selected_ids', []);  // 표시할 캘린더 id 배열
+let gcalWriteCalendarId = load('gcal_write_calendar_id', null);  // 새 일정 추가 대상 캘린더
+let gcalEvents = load('gcal_events_cache', {});  // { 'cal_id:event_id': {...event, _calendarId} }
+let gcalLastFetchAt = load('gcal_last_fetch_at', 0);  // ms
+let gcalEnabled = load('gcal_enabled', false);
+
+// 캘린더 모드: 'all'(둘 다) | 'mine'(timeBlock만) | 'google'(gcal만). 기본값 'all'
+let calendarMode = load('calendar_mode', 'all');
+// 옛 'mine'/'google' 저장값은 그대로 호환
+
+// API 호출 헬퍼
+// driveClient 토큰을 그대로 쓴다 (같은 scope에 calendar 포함)
+async function _gcalApi(method, path, body, params) {
+  if (typeof driveClient === 'undefined') throw new Error('driveClient 미준비 — sync.js 먼저 로드');
+  await driveClient.ensureToken();
+  const url = new URL(GCAL_API + path);
+  if (params) for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString(), {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + driveClient.accessToken,
+      ...(body ? { 'Content-Type': 'application/json' } : {})
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const err = new Error(`GCal API ${res.status}: ${text || res.statusText}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+// 캘린더 목록
+async function fetchGCalCalendarList() {
+  const data = await _gcalApi('GET', '/users/me/calendarList', null, {
+    fields: 'items(id,summary,primary,backgroundColor,foregroundColor,accessRole,selected)',
+    minAccessRole: 'reader',
+  });
+  const items = (data && data.items) || [];
+  gcalCalendars = items.map(c => ({
+    id: c.id,
+    summary: c.summary,
+    primary: !!c.primary,
+    backgroundColor: c.backgroundColor || '#A4BDFC',
+    foregroundColor: c.foregroundColor || '#FFFFFF',
+    accessRole: c.accessRole,  // 'owner' | 'writer' | 'reader' | 'freeBusyReader'
+    selected: !!c.selected,
+  }));
+  save('gcal_calendars', gcalCalendars);
+  // 첫 fetch: primary 캘린더를 자동 선택하고 쓰기 대상도 primary로
+  if (gcalSelectedIds.length === 0) {
+    const primary = gcalCalendars.find(c => c.primary);
+    if (primary) {
+      gcalSelectedIds = [primary.id];
+      save('gcal_selected_ids', gcalSelectedIds);
+      if (!gcalWriteCalendarId) {
+        gcalWriteCalendarId = primary.id;
+        save('gcal_write_calendar_id', primary.id);
+      }
+    }
+  }
+  return gcalCalendars;
+}
+
+// 이 기기에서 방금 만들거나 고친 일정.
+// events.list는 쓰기 직후 잠깐 그 일정을 안 돌려줄 때가 있고(eventual consistency),
+// fetchGCalEvents는 캐시를 통째로 새로 만들어서 그 사이 fetch가 끼면 일정이 사라진다.
+// 최근 것만 잠깐 들고 있다가 fetch 결과에 없으면 다시 채운다.
+const _gcalRecentLocal = new Map();   // key -> { ev, at }
+const GCAL_RECENT_TTL = 60_000;
+
+function _gcalMergeRecentLocal(map) {
+  const now = Date.now();
+  for (const [k, v] of _gcalRecentLocal) {
+    if (now - v.at > GCAL_RECENT_TTL) { _gcalRecentLocal.delete(k); continue; }
+    if (!map[k]) map[k] = v.ev;   // 서버가 아직 안 돌려준 것만 보충
+  }
+  return map;
+}
+
+// 이벤트 fetch (선택된 모든 캘린더, 기간)
+async function fetchGCalEvents(timeMin, timeMax) {
+  if (!gcalEnabled) return [];
+  if (gcalSelectedIds.length === 0) return [];
+  const allEvents = [];
+  await Promise.all(gcalSelectedIds.map(async (calId) => {
+    try {
+      const data = await _gcalApi('GET', `/calendars/${encodeURIComponent(calId)}/events`, null, {
+        timeMin: timeMin.toISOString(),
+        timeMax: timeMax.toISOString(),
+        singleEvents: 'true',   // 반복 일정도 개별 인스턴스로 펼침
+        orderBy: 'startTime',
+        maxResults: '2500',   // 월 단위로 받으므로 상한을 올린다 (Google 최대치)
+        fields: 'items(id,summary,description,location,start,end,colorId,creator,htmlLink,recurringEventId,status)',
+      });
+      const items = (data && data.items) || [];
+      for (const ev of items) {
+        if (ev.status === 'cancelled') continue;
+        ev._calendarId = calId;
+        allEvents.push(ev);
+      }
+    } catch (e) {
+      console.warn('[GCal] fetch failed for', calId, e.message);
+    }
+  }));
+  // 캐시 갱신. 방금 만든 일정이 서버 응답에 아직 없으면 보충한다
+  const next = {};
+  for (const ev of allEvents) next[`${ev._calendarId}:${ev.id}`] = ev;
+  gcalEvents = _gcalMergeRecentLocal(next);
+  save('gcal_events_cache', gcalEvents);
+  gcalLastFetchAt = Date.now();
+  save('gcal_last_fetch_at', gcalLastFetchAt);
+  return allEvents;
+}
+
+// CRUD
+// 새 일정 추가 (쓰기 대상 캘린더로)
+// body: { summary, description, location, start, end }  (start/end: ISO with timezone)
+async function createGCalEvent(payload) {
+  const calId = gcalWriteCalendarId || (gcalCalendars.find(c => c.primary) || {}).id;
+  if (!calId) throw new Error('쓰기 대상 캘린더가 설정되지 않았어요');
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Seoul';
+  const body = {
+    summary: payload.summary || '',
+    description: payload.description || undefined,
+    location: payload.location || undefined,
+    start: payload.allDay
+      ? { date: payload.start }                        // 'YYYY-MM-DD'
+      : { dateTime: payload.start, timeZone: tz },     // ISO
+    end: payload.allDay
+      ? { date: payload.end }
+      : { dateTime: payload.end, timeZone: tz },
+  };
+  const created = await _gcalApi('POST', `/calendars/${encodeURIComponent(calId)}/events`, body);
+  if (created) {
+    created._calendarId = calId;
+    const k = `${calId}:${created.id}`;
+    gcalEvents[k] = created;
+    _gcalRecentLocal.set(k, { ev: created, at: Date.now() });
+    save('gcal_events_cache', gcalEvents);
+  }
+  return created;
+}
+
+// 기존 일정 수정
+async function updateGCalEvent(calId, eventId, patch) {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Seoul';
+  const body = {};
+  if (patch.summary !== undefined) body.summary = patch.summary;
+  if (patch.description !== undefined) body.description = patch.description;
+  if (patch.location !== undefined) body.location = patch.location;
+  if (patch.start) {
+    body.start = patch.allDay ? { date: patch.start } : { dateTime: patch.start, timeZone: tz };
+  }
+  if (patch.end) {
+    body.end = patch.allDay ? { date: patch.end } : { dateTime: patch.end, timeZone: tz };
+  }
+  const updated = await _gcalApi('PATCH', `/calendars/${encodeURIComponent(calId)}/events/${encodeURIComponent(eventId)}`, body);
+  if (updated) {
+    updated._calendarId = calId;
+    const k = `${calId}:${updated.id}`;
+    gcalEvents[k] = updated;
+    _gcalRecentLocal.set(k, { ev: updated, at: Date.now() });
+    save('gcal_events_cache', gcalEvents);
+  }
+  return updated;
+}
+
+// 삭제
+async function deleteGCalEvent(calId, eventId) {
+  await _gcalApi('DELETE', `/calendars/${encodeURIComponent(calId)}/events/${encodeURIComponent(eventId)}`);
+  const k = `${calId}:${eventId}`;
+  delete gcalEvents[k];
+  // 최근 목록에서도 빼야 다음 fetch에서 되살아나지 않는다
+  _gcalRecentLocal.delete(k);
+  save('gcal_events_cache', gcalEvents);
+}
+
+// 설정 토글
+function setGCalEnabled(on) {
+  gcalEnabled = !!on;
+  save('gcal_enabled', gcalEnabled);
+}
+
+// 사용자가 설정에서 직접 껐는지 여부.
+// gcal_enabled는 Drive 동기화 대상이 아니라 기기별이라(getAllData 참고) 새 기기에선 늘 꺼진 채 시작하고,
+// 모드 탭을 눌러야만 불러오는 것처럼 보였다. 진입 시 자동으로 켜되 사용자가 끈 경우는 그대로 둔다.
+let gcalUserOff = load('gcal_user_off', false);
+function setGCalUserOff(off) {
+  gcalUserOff = !!off;
+  save('gcal_user_off', gcalUserOff);
+}
+// 캘린더 진입 시 호출. 켤 만한 상황이면 켜고 true 반환.
+function maybeAutoEnableGCal() {
+  if (gcalEnabled) return true;
+  if (gcalUserOff) return false;                    // 사용자가 끈 건 건드리지 않음
+  // 토큰 유무로 보면 안 된다. 앱 시작 직후엔 initDrive의 토큰 복원이 안 끝나 늘 false다.
+  // Drive를 연결한 적이 있는지로 판단하고, 토큰은 fetch 때 ensureToken이 확보한다.
+  const connected = (typeof driveFolderId !== 'undefined' && !!driveFolderId);
+  if (!connected) return false;
+  setGCalEnabled(true);
+  return true;
+}
+
+function setCalendarMode(mode) {
+  // 'all' | 'mine' | 'google'
+  calendarMode = (mode === 'google' || mode === 'mine' || mode === 'all') ? mode : 'all';
+  save('calendar_mode', calendarMode);
+  if (typeof renderCalendar === 'function') renderCalendar();
+}
+
+// 헬퍼
+// 이벤트 시작/끝 시각을 Date로
+function gcalEventStart(ev) {
+  return new Date(ev.start.dateTime || ev.start.date);
+}
+function gcalEventEnd(ev) {
+  return new Date(ev.end.dateTime || ev.end.date);
+}
+function gcalEventIsAllDay(ev) {
+  return !!ev.start.date && !ev.start.dateTime;
+}
+
+// 캘린더 background 색
+function gcalEventColor(ev) {
+  const cal = gcalCalendars.find(c => c.id === ev._calendarId);
+  return cal ? cal.backgroundColor : '#A4BDFC';
+}
+
+// UI: 동기화 모달의 캘린더 선택 섹션
+// 모달 열릴 때 호출. 연결 상태에 따라 표시 분기
+function renderGCalSection() {
+  const cb = document.getElementById('setting-gcal-enabled');
+  const connected = (typeof driveClient !== 'undefined') && driveClient.hasValidToken();
+  const ncEl = document.getElementById('gcal-not-connected');
+  const cEl = document.getElementById('gcal-connected');
+  if (cb) cb.checked = !!gcalEnabled;
+  if (ncEl) ncEl.style.display = connected ? 'none' : '';
+  if (cEl)  cEl.style.display  = (connected && gcalEnabled) ? '' : 'none';
+  if (connected && gcalEnabled) _renderGCalLists();
+}
+window.renderGCalSection = renderGCalSection;
+
+function _renderGCalLists() {
+  const listEl = document.getElementById('gcal-list');
+  const writeEl = document.getElementById('gcal-write-cal');
+  if (listEl) {
+    if (gcalCalendars.length === 0) {
+      listEl.innerHTML = `<div class="gcal-empty">캘린더 목록 새로고침을 누르세요</div>`;
+    } else {
+      listEl.innerHTML = gcalCalendars.map(c => {
+        const checked = gcalSelectedIds.includes(c.id) ? 'checked' : '';
+        const readonly = (c.accessRole === 'reader' || c.accessRole === 'freeBusyReader')
+          ? '<span class="gcal-cal-badge readonly">읽기</span>' : '';
+        const primary = c.primary ? '<span class="gcal-cal-badge primary">기본</span>' : '';
+        const safeId = c.id.replace(/'/g, "\\'");
+        return `<label class="gcal-cal-row">
+          <input type="checkbox" class="gcal-cal-cb" ${checked} onchange="onGCalCalendarToggle('${safeId}', this.checked)" style="accent-color:${c.backgroundColor};">
+          <span class="gcal-cal-dot" style="background:${c.backgroundColor};"></span>
+          <span class="gcal-cal-name">${_escapeGCal(c.summary)}</span>
+          ${primary}${readonly}
+        </label>`;
+      }).join('');
+    }
+  }
+  if (writeEl) {
+    const writableCals = gcalCalendars.filter(c => c.accessRole === 'owner' || c.accessRole === 'writer');
+    if (writableCals.length === 0) {
+      writeEl.innerHTML = `<option value="">쓰기 가능한 캘린더가 없어요</option>`;
+    } else {
+      writeEl.innerHTML = writableCals.map(c =>
+        `<option value="${c.id}" ${c.id === gcalWriteCalendarId ? 'selected' : ''}>${_escapeGCal(c.summary)}${c.primary ? ' (기본)' : ''}</option>`
+      ).join('');
+    }
+  }
+}
+
+function _escapeGCal(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// 연동 on/off 토글
+window.onToggleGCalEnabled = async function() {
+  const cb = document.getElementById('setting-gcal-enabled');
+  if (!cb) return;
+  setGCalEnabled(cb.checked);
+  // 여기서 끈 건 사용자 의사이므로 캘린더 진입 시 자동으로 다시 켜지 않는다
+  setGCalUserOff(!cb.checked);
+  if (cb.checked) {
+    // 처음 켜면 캘린더 목록 로드
+    if (gcalCalendars.length === 0) await loadGCalCalendars();
+  }
+  renderGCalSection();
+};
+
+// 캘린더 목록 fetch (버튼 클릭)
+window.loadGCalCalendars = async function() {
+  try {
+    if (typeof toast === 'function') toast('Google 캘린더 목록 불러오는 중...');
+    await fetchGCalCalendarList();
+    if (typeof toast === 'function') toast(`캘린더 ${gcalCalendars.length}개 로드됨`, 'success');
+    _renderGCalLists();
+  } catch (e) {
+    console.warn('[GCal] list fetch failed:', e);
+    if (typeof toast === 'function') {
+      if (e.status === 403) {
+        toast('Calendar API가 활성화되지 않았어요. Google Cloud Console에서 활성화하세요', 'error');
+      } else if (e.status === 401) {
+        toast('인증이 만료됐어요. 동기화 버튼 한 번 누르세요', 'error');
+      } else {
+        toast('캘린더 목록 가져오기 실패', 'error');
+      }
+    }
+  }
+};
+
+// 캘린더 선택 토글
+window.onGCalCalendarToggle = function(calId, checked) {
+  if (checked) {
+    if (!gcalSelectedIds.includes(calId)) gcalSelectedIds = [...gcalSelectedIds, calId];
+  } else {
+    gcalSelectedIds = gcalSelectedIds.filter(x => x !== calId);
+  }
+  save('gcal_selected_ids', gcalSelectedIds);
+  // 표시할 캘린더가 바뀌면 받아둔 기간 캐시는 더 이상 유효하지 않다
+  if (typeof invalidateGCalRange === 'function') invalidateGCalRange();
+};
+
+// 쓰기 대상 캘린더 변경
+window.onGCalWriteCalendarChange = function() {
+  const sel = document.getElementById('gcal-write-cal');
+  if (!sel) return;
+  gcalWriteCalendarId = sel.value;
+  save('gcal_write_calendar_id', gcalWriteCalendarId);
+};
+
+// UI: Google 일정 편집 모달
+let _gcalEditingKey = null;  // 'calId:eventId' 또는 null (신규)
+let _gcalEditingNewSlot = null; // {dayKey, hour, minute} 신규 시간 미리채움
+
+// 종일 일정의 end.date는 exclusive다 (7/29 하루짜리 = start 07-29, end 07-30).
+// 화면엔 포함 종료일을 보여야 하니 열 때 하루 빼고 저장할 때 하루 더한다.
+// 이게 없으면 종료일이 하루 밀려 보이고, 새로 만들면 start==end라 아예 안 보인다.
+function _gcalShiftDays(d, n) {
+  const r = new Date(d);
+  r.setDate(r.getDate() + n);
+  return r;
+}
+function _gcalShiftDateStr(s, n) {
+  if (!s) return s;
+  const [y, m, d] = s.split('-').map(Number);
+  const r = new Date(y, m - 1, d + n);
+  const p = x => String(x).padStart(2, '0');
+  return `${r.getFullYear()}-${p(r.getMonth() + 1)}-${p(r.getDate())}`;
+}
+
+window.openGCalEditor = function(calId, eventId) {
+  const ev = gcalEvents[`${calId}:${eventId}`];
+  if (!ev) { toast('일정을 찾을 수 없어요'); return; }
+  _gcalEditingKey = `${calId}:${eventId}`;
+  _gcalEditingNewSlot = null;
+  const allDay = gcalEventIsAllDay(ev);
+  const endDate = allDay ? _gcalShiftDays(gcalEventEnd(ev), -1) : gcalEventEnd(ev);
+  _openGCalModal({
+    title: ev.summary || '',
+    description: ev.description || '',
+    location: ev.location || '',
+    start: gcalEventStart(ev),
+    end: endDate,
+    allDay,
+    calId,
+    eventId,
+    canDelete: true,
+  });
+};
+
+window.openGCalNewEvent = function(dayKey, hour, minute) {
+  if (!gcalWriteCalendarId) {
+    toast('쓰기 대상 캘린더가 설정되지 않았어요', 'error');
+    return;
+  }
+  _gcalEditingKey = null;
+  _gcalEditingNewSlot = { dayKey, hour, minute };
+  const [y, m, d] = dayKey.split('-').map(Number);
+  const start = new Date(y, m-1, d, hour, minute);
+  const end = new Date(start.getTime() + 60 * 60 * 1000);
+  _openGCalModal({
+    title: '', description: '', location: '',
+    start, end, allDay: false,
+    calId: gcalWriteCalendarId,
+    canDelete: false,
+  });
+};
+
+function _openGCalModal({title, description, location, start, end, allDay, calId, eventId, canDelete}) {
+  // 기존 모달 제거
+  document.getElementById('gcal-editor-modal')?.remove();
+  const writableCals = gcalCalendars.filter(c => c.accessRole === 'owner' || c.accessRole === 'writer');
+  const calOptions = writableCals.map(c =>
+    `<option value="${c.id}" ${c.id === calId ? 'selected' : ''}>${_escapeGCal(c.summary)}</option>`
+  ).join('');
+  const fmtDate = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const fmtTime = d => `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  const overlay = document.createElement('div');
+  overlay.id = 'gcal-editor-modal';
+  overlay.className = 'modal-overlay show';
+  overlay.innerHTML = `
+    <div class="modal" onclick="event.stopPropagation()" style="max-width:480px;">
+      <h3>${eventId ? '📅 일정 수정' : '📅 새 일정'}</h3>
+      <label>제목</label>
+      <input type="text" id="gcal-edit-title" placeholder="일정 제목" value="${_escapeGCal(title)}">
+      <label style="margin-top:14px;">캘린더</label>
+      <select id="gcal-edit-cal" style="width:100%;padding:8px 10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;">${calOptions}</select>
+      <label style="margin-top:14px;display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;color:var(--text);font-weight:500;">
+        <input type="checkbox" id="gcal-edit-allday" ${allDay ? 'checked' : ''} onchange="_gcalEditorAllDayToggle()" style="width:18px;height:18px;accent-color:var(--accent);">
+        종일
+      </label>
+      <div class="time-row-input" style="margin-top:10px;">
+        <div>
+          <label style="margin-top:0;">시작</label>
+          <input type="date" id="gcal-edit-start-date" value="${fmtDate(start)}">
+          <input type="time" id="gcal-edit-start-time" value="${fmtTime(start)}" style="margin-top:4px;${allDay?'display:none;':''}">
+        </div>
+        <div>
+          <label style="margin-top:0;">종료</label>
+          <input type="date" id="gcal-edit-end-date" value="${fmtDate(end)}">
+          <input type="time" id="gcal-edit-end-time" value="${fmtTime(end)}" style="margin-top:4px;${allDay?'display:none;':''}">
+        </div>
+      </div>
+      <label style="margin-top:14px;">위치 (선택)</label>
+      <input type="text" id="gcal-edit-location" placeholder="장소" value="${_escapeGCal(location)}">
+      <label style="margin-top:14px;">설명 (선택)</label>
+      <textarea id="gcal-edit-description" placeholder="메모" style="min-height:64px;">${_escapeGCal(description)}</textarea>
+      <div class="modal-actions" style="margin-top:18px;">
+        ${canDelete ? `<button class="danger" onclick="_gcalEditorDelete()" style="margin-right:auto;">삭제</button>` : ''}
+        <button onclick="_gcalEditorClose()">취소</button>
+        <button class="primary" onclick="_gcalEditorSave()">저장</button>
+      </div>
+    </div>
+  `;
+  overlay.addEventListener('click', e => { if (e.target === overlay) _gcalEditorClose(); });
+  document.body.appendChild(overlay);
+}
+
+window._gcalEditorClose = function() {
+  document.getElementById('gcal-editor-modal')?.remove();
+  _gcalEditingKey = null;
+};
+
+window._gcalEditorAllDayToggle = function() {
+  const allDay = document.getElementById('gcal-edit-allday').checked;
+  document.getElementById('gcal-edit-start-time').style.display = allDay ? 'none' : '';
+  document.getElementById('gcal-edit-end-time').style.display = allDay ? 'none' : '';
+};
+
+window._gcalEditorSave = async function() {
+  const title = document.getElementById('gcal-edit-title').value.trim();
+  if (!title) { toast('제목을 입력하세요'); return; }
+  const calId = document.getElementById('gcal-edit-cal').value;
+  const allDay = document.getElementById('gcal-edit-allday').checked;
+  const sd = document.getElementById('gcal-edit-start-date').value;
+  const st = document.getElementById('gcal-edit-start-time').value;
+  const ed = document.getElementById('gcal-edit-end-date').value;
+  const et = document.getElementById('gcal-edit-end-time').value;
+  const description = document.getElementById('gcal-edit-description').value;
+  const location = document.getElementById('gcal-edit-location').value;
+  // 종일이면 종료일을 하루 더해 보낸다 (Google의 end.date는 미포함).
+  // 비어 있거나 시작보다 앞서면 시작일로 맞춰 하루짜리로 만든다.
+  let allDayEnd = ed && ed >= sd ? ed : sd;
+  const payload = {
+    summary: title,
+    description,
+    location,
+    allDay,
+    start: allDay ? sd : new Date(`${sd}T${st}:00`).toISOString(),
+    end:   allDay ? _gcalShiftDateStr(allDayEnd, 1) : new Date(`${ed}T${et}:00`).toISOString(),
+  };
+  try {
+    if (_gcalEditingKey) {
+      // 수정. 캘린더가 바뀐 경우는 아직 같은 캘린더 update만 지원 (이동은 미구현)
+      const [origCalId, eventId] = _gcalEditingKey.split(':');
+      await updateGCalEvent(origCalId, eventId, payload);
+      toast('일정 수정됨', 'success');
+    } else {
+      // 신규. 선택한 calId로 잠깐 gcalWriteCalendarId를 바꿔 생성
+      const prevWrite = gcalWriteCalendarId;
+      if (calId && calId !== prevWrite) gcalWriteCalendarId = calId;
+      await createGCalEvent(payload);
+      if (calId !== prevWrite) gcalWriteCalendarId = prevWrite;  // 되돌림
+      toast('일정 생성됨', 'success');
+    }
+    _gcalEditorClose();
+    // 서버 기준으로 다시 읽어서 렌더한다. renderCalendar만 부르면 로컬 캐시만 그려서
+    // 반복 일정 전개나 서버 보정값이 반영되지 않는다. 방금 만든 건은 _gcalRecentLocal이 채운다.
+    if (typeof invalidateGCalRange === "function") invalidateGCalRange();
+    if (typeof refreshGCalEventsForVisibleWeek === "function") await refreshGCalEventsForVisibleWeek({ force: true });
+    else if (typeof renderCalendar === 'function') renderCalendar();
+  } catch (e) {
+    console.warn('[GCal] save failed:', e);
+    toast('일정 저장 실패: ' + (e.message || ''), 'error');
+  }
+};
+
+window._gcalEditorDelete = async function() {
+  if (!_gcalEditingKey) return;
+  if (!confirm('이 일정을 Google Calendar에서 삭제할까요?')) return;
+  const [calId, eventId] = _gcalEditingKey.split(':');
+  try {
+    await deleteGCalEvent(calId, eventId);
+    toast('일정 삭제됨', 'success');
+    _gcalEditorClose();
+    if (typeof invalidateGCalRange === "function") invalidateGCalRange();
+    if (typeof refreshGCalEventsForVisibleWeek === "function") await refreshGCalEventsForVisibleWeek({ force: true });
+    else if (typeof renderCalendar === 'function') renderCalendar();
+  } catch (e) {
+    console.warn('[GCal] delete failed:', e);
+    toast('삭제 실패: ' + (e.message || ''), 'error');
+  }
+};
+
+window.gcal = {
+  fetchCalendarList: fetchGCalCalendarList,
+  fetchEvents: fetchGCalEvents,
+  create: createGCalEvent,
+  update: updateGCalEvent,
+  delete: deleteGCalEvent,
+  setEnabled: setGCalEnabled,
+  setMode: setCalendarMode,
+  // state
+  get calendars()    { return gcalCalendars; },
+  get selectedIds()  { return gcalSelectedIds; },
+  get writeId()      { return gcalWriteCalendarId; },
+  get events()       { return gcalEvents; },
+  get enabled()      { return gcalEnabled; },
+  get mode()         { return calendarMode; },
+  set selectedIds(v) { gcalSelectedIds = v; save('gcal_selected_ids', v); },
+  set writeId(v)     { gcalWriteCalendarId = v; save('gcal_write_calendar_id', v); },
+  // utils
+  eventStart: gcalEventStart,
+  eventEnd: gcalEventEnd,
+  eventIsAllDay: gcalEventIsAllDay,
+  eventColor: gcalEventColor,
+};
